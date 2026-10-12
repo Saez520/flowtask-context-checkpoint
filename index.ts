@@ -17,8 +17,9 @@ export default Plugin.define({
         if (!state.isChild(event.sessionID)) return
         const reading = readContextWindow(state.getUsage(event.sessionID))
         if (reading.tokens === undefined) { state.reset(event.sessionID); log(`measurement-unavailable:${event.sessionID}:${reading.reason ?? "missing-token-data"}`); return }
-        const limit = findContextLimit((await ctx.model.list()).data, event.model as ModelReference) ?? options.assumedContextLimit
-        if (limit === options.assumedContextLimit) log(`assumed-context-limit:${event.sessionID}`)
+        const discoveredLimit = findContextLimit((await ctx.model.list()).data, event.model as ModelReference)
+        const limit = discoveredLimit ?? options.assumedContextLimit
+        if (discoveredLimit === undefined) log(`assumed-context-limit:${event.sessionID}`)
         const ratio = reading.tokens / limit
         if (ratio < options.checkpointThreshold) { state.reset(event.sessionID); return }
         event.system.push({ type: "text", text: checkpointInstruction(reading.tokens, limit, ratio) })
