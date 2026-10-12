@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import { checkpointInstruction } from "./lib/checkpoint-instruction"
 import { parseOptions } from "./lib/config"
-import { readContextWindow } from "./lib/context-window"
+import { findContextLimit, readContextWindow, type ModelReference, type TokenUsage } from "./lib/context-window"
 import { SessionState } from "./lib/session-state"
 
 export default Plugin.define({
@@ -11,38 +11,52 @@ export default Plugin.define({
     const options = parseOptions(ctx.options as Record<string, unknown>, key => log(`invalid-option:${key}`))
     const state = new SessionState()
     const controller = new AbortController()
-    const hook = await ctx.session.hook("context", async (rawEvent: unknown) => {
-      const event = rawEvent as any
+    const contextHook = await ctx.session.hook("context", async event => {
       if (!options.enabled) return
       try {
-        const session = await ctx.session.get({ sessionID: event.sessionID })
-        if (!(session as any).parentID || (session as any).directory !== (ctx.location as any).directory) return
-        const limits = (event as any).model?.limit?.context
-        const limit = typeof limits === "number" && Number.isFinite(limits) && limits > 0 ? limits : options.assumedContextLimit
-        const reading = readContextWindow(event.sessionID)
-        if (!reading.tokens) { state.reset(event.sessionID); log(`measurement-unavailable:${event.sessionID}:${reading.reason ?? "zero-tokens"}`); return }
+        if (!state.isChild(event.sessionID)) return
+        const reading = readContextWindow(state.getUsage(event.sessionID))
+        if (reading.tokens === undefined) { state.reset(event.sessionID); log(`measurement-unavailable:${event.sessionID}:${reading.reason ?? "missing-token-data"}`); return }
+        const limit = findContextLimit((await ctx.model.list()).data, event.model as ModelReference) ?? options.assumedContextLimit
+        if (limit === options.assumedContextLimit) log(`assumed-context-limit:${event.sessionID}`)
         const ratio = reading.tokens / limit
         if (ratio < options.checkpointThreshold) { state.reset(event.sessionID); return }
-        (event as any).system.push({ type: "text", text: checkpointInstruction(reading.tokens, limit, ratio) })
+        event.system.push({ type: "text", text: checkpointInstruction(reading.tokens, limit, ratio) })
         state.markEmitted(event.sessionID)
       } catch { log(`context-hook-failed:${event.sessionID}`) }
     })
+    const compactionHook = await ctx.session.hook("compaction", event => {
+      state.invalidateUsage(event.sessionID)
+    })
     void (async () => {
       try {
-        for await (const event of ctx.event.subscribe({ signal: controller.signal }) as AsyncIterable<any>) {
+        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           if (event.type === "session.deleted") {
-            const sessionID = (event.properties as { info?: { id?: string } }).info?.id
+            const sessionID = event.data.sessionID
             if (sessionID) state.delete(sessionID)
+            continue
           }
-          if (event.type !== "message.updated") continue
-          const props = event.properties as { info?: { id?: string; role?: string; time?: { completed?: number }; summary?: string }; sessionID?: string }
-          const info = props.info, sessionID = props.sessionID
-          if (!info || !sessionID || info.role !== "assistant" || !info.time?.completed || !info.id) continue
-          const count = state.consumeAssistant(sessionID, info.id, Boolean(info.summary?.includes("[FLOWTASK_CHECKPOINT_CAPACITY:")))
+          if (event.type === "session.created") {
+            if (event.data.parentID && event.data.location.directory === ctx.location.directory) state.addChild(event.data.sessionID)
+            continue
+          }
+          if (event.type !== "session.step.ended") continue
+          const { sessionID, assistantMessageID, tokens } = event.data
+          if (state.isChild(sessionID)) state.setUsage(sessionID, tokens as TokenUsage)
+          const dedupeID = `${sessionID}:${assistantMessageID}`
+          let hasTag = false
+          try {
+            const result = await ctx.session.context({ sessionID })
+            const candidate = result.find(item => item.id === assistantMessageID)
+            if (!candidate || candidate.type !== "assistant") { state.reset(sessionID); log(`assistant-message-unavailable:${sessionID}`); continue }
+            const message = candidate
+            hasTag = message.content.filter(part => part.type === "text").map(part => part.text).join("\n").includes("[FLOWTASK_CHECKPOINT_CAPACITY:")
+          } catch { state.reset(sessionID); log(`assistant-message-unavailable:${sessionID}`); continue }
+          const count = state.consumeAssistant(sessionID, dedupeID, hasTag)
           if (count !== undefined && count >= 2) log(`consecutive-omissions:${sessionID}:${count}`)
         }
       } catch { if (!controller.signal.aborted) log("event-stream-failed") }
     })()
-    return async () => { controller.abort(); state.clear(); await hook.dispose() }
+    return async () => { controller.abort(); state.clear(); await Promise.all([contextHook.dispose(), compactionHook.dispose()]) }
   },
 })

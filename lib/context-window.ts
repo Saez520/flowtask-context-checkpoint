@@ -1,19 +1,21 @@
-import { Database } from "bun:sqlite"
-import { homedir } from "node:os"
-import { join } from "node:path"
-export interface WindowReading { tokens: number; reason?: string }
-export function readContextWindow(sessionID: string, databasePath = join(homedir(), ".local/share/opencode/opencode.db")): WindowReading {
-  let db: Database | undefined
-  try {
-    db = new Database(databasePath, { readonly: true })
-    if (!db.query("SELECT id FROM session_v2 WHERE id = ?").get(sessionID)) return { tokens: 0, reason: "session-not-found" }
-    const row = db.query("SELECT data FROM session_message WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant' AND json_extract(data, '$.time.completed') IS NOT NULL ORDER BY time_created DESC LIMIT 1").get(sessionID) as { data: string } | undefined
-    if (!row) return { tokens: 0, reason: "assistant-message-not-found" }
-    const msg = JSON.parse(row.data) as { tokens?: Record<string, unknown> }
-    const t = msg.tokens, cache = t?.cache as Record<string, unknown> | undefined
-    const values = [t?.input, t?.output, t?.reasoning, cache?.read]
-    if (!values.every(v => typeof v === "number" && Number.isFinite(v) && v >= 0)) return { tokens: 0, reason: "invalid-token-data" }
-    return { tokens: values.reduce<number>((sum, v) => sum + (v as number), 0) }
-  } catch { return { tokens: 0, reason: "database-or-json-error" } }
-  finally { db?.close() }
+export interface TokenUsage { input: number; cache: { read: number; write: number } }
+export interface WindowReading { tokens?: number; reason?: string }
+
+export function readContextWindow(usage: TokenUsage | undefined): WindowReading {
+  if (!usage || !usage.cache) return { reason: "missing-token-data" }
+  const values: number[] = [usage.input, usage.cache.read, usage.cache.write]
+  if (!values.every(value => typeof value === "number" && Number.isFinite(value) && value >= 0)) {
+    return { reason: "invalid-token-data" }
+  }
+  return { tokens: values.reduce((sum, value) => sum + value, 0) }
+}
+
+export interface ModelReference { providerID: string; id: string; variant?: string }
+export interface ModelWithLimit { providerID: string; id: string; variant?: string; limit?: { context?: number } }
+
+export function findContextLimit(models: readonly ModelWithLimit[], reference: ModelReference): number | undefined {
+  const model = models.find(candidate => candidate.providerID === reference.providerID
+    && candidate.id === reference.id && candidate.variant === reference.variant)
+  const limit = model?.limit?.context
+  return typeof limit === "number" && Number.isFinite(limit) && limit > 0 ? limit : undefined
 }
