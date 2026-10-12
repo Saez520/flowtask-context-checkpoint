@@ -20,7 +20,7 @@ export class SessionState {
   apply(id:string, epoch:number, hasTag:boolean|undefined):number|undefined { const e=this.entry(id); if(e.epoch!==epoch)return; if(hasTag===undefined){this.reset(id);return 0} if(hasTag){this.reset(id);return 0} e.omissions++;return e.omissions }
   invalidateUsage(id:string):void { const e=this.entry(id); e.usage=undefined; this.resetEntry(e,true) }
   fail(id:string):void { this.resetEntry(this.entry(id),true) }
-  cutStream():void { for(const e of this.entries.values())if(e.window){e.tainted=true;this.resetEntry(e,true)} }
+  cutStream():void { for(const e of this.entries.values()){e.tainted=true;e.usage=undefined;this.resetEntry(e,true)} }
   reset(id:string):void { const e=this.entry(id);e.omissions=0;e.armed=false;e.window=undefined }
   private resetEntry(e:Entry,epoch:boolean):void { e.omissions=0;e.armed=false;e.window=undefined;if(epoch)e.epoch++ }
   delete(id:string):void { const e=this.entry(id);this.resetEntry(e,true);this.entries.delete(id) }

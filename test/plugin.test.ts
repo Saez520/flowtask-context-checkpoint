@@ -3,11 +3,21 @@ import { parseOptions } from "../lib/config"
 import { SessionState } from "../lib/session-state"
 import { findContextLimit, readContextWindow } from "../lib/context-window"
 import plugin from "../index"
-import { childCreated, completedStep, createPluginHarness } from "./fixtures"
+import { childCreated, completedStep, createPluginHarness, executionFailed, executionInterrupted, stepFailed, stepStarted, textEnded } from "./fixtures"
 
 async function startHarness(harness: ReturnType<typeof createPluginHarness>) {
   const setup = (plugin as unknown as { setup(ctx: unknown): Promise<() => Promise<void>> }).setup
   return setup(harness.context)
+}
+
+async function withImmediateTimers<T>(work: () => Promise<T>, delays: number[] = []): Promise<T> {
+  const original = globalThis.setTimeout
+  globalThis.setTimeout = ((callback: Parameters<typeof setTimeout>[0], delay?: number) => {
+    delays.push(Number(delay ?? 0))
+    if (typeof callback === "function") callback()
+    return 0 as unknown as ReturnType<typeof setTimeout>
+  }) as typeof setTimeout
+  try { return await work() } finally { globalThis.setTimeout = original }
 }
 
 describe("configuration", () => {
@@ -31,6 +41,24 @@ describe("session lifecycle", () => {
     for(let i=0;i<34;i++){state.arm("child");state.start("child");state.finish("child",`m${i}`)}
     expect(state.isFinished("child","m0")).toBe(false)
     state.clear()
+  })
+
+  test("invalidates armed usage and omissions on a stream cut without an open window", () => {
+    const state = new SessionState()
+    state.addChild("child")
+    state.setUsage("child", { input: 70, cache: { read: 0, write: 0 } })
+    state.arm("child")
+    const epoch = state.getEpoch("child")
+    expect(state.apply("child", epoch, false)).toBe(1)
+
+    state.cutStream()
+
+    expect(state.getUsage("child")).toBeUndefined()
+    expect(state.isArmed("child")).toBe(false)
+    expect(state.getEpoch("child")).toBe(epoch + 1)
+    expect(state.apply("child", epoch, false)).toBeUndefined()
+    expect(state.apply("child", epoch + 1, false)).toBe(1)
+    expect(state.start("child")).toBe(false)
   })
 })
 describe("V2 usage events", () => {
@@ -99,7 +127,7 @@ describe("V2 event-driven plugin", () => {
     const fresh = { ...stale, system: [] as unknown[] }
     await harness.runHook("context", fresh)
     expect(fresh.system).toHaveLength(1)
-    harness.setMessage("child", { id: "step-2", type: "assistant", content: [{ type: "text", text: "answer" }] })
+    harness.appendMessage("child", { id: "step-2", type: "assistant", content: [{ type: "text", text: "answer" }] })
     harness.emit(completedStep("child", "step-2", 701))
     await harness.flush()
     harness.emit({ type: "session.deleted", data: { sessionID: "child" } })
@@ -186,5 +214,205 @@ describe("V2 event-driven plugin", () => {
     await harness.runHook("context", at)
     expect(at.system).toHaveLength(1)
     await cleanup()
+  })
+
+  test("keeps tool-call steps in one response window until a terminal finish", async () => {
+    const harness = createPluginHarness()
+    const cleanup = await startHarness(harness)
+    try {
+      harness.emit(childCreated())
+      await harness.flush()
+      harness.emit(completedStep("child", "measure", 700))
+      await harness.flush()
+      await harness.runHook("context", { sessionID: "child", model: { providerID: "provider", id: "model" }, system: [] })
+
+      harness.emit(stepStarted())
+      harness.emit(textEnded("child", "reply", "first part"))
+      harness.appendMessage("child", { id: "reply", type: "assistant", content: [{ type: "text", text: "first part\nsecond part" }] })
+      harness.emit(completedStep("child", "reply", 700, "tool-calls"))
+      await harness.flush()
+      expect(harness.contextReads).toBe(0)
+
+      // The next step continues the same armed response in the event contract.
+      harness.emit(textEnded("child", "reply", "second part", 1))
+      harness.emit(completedStep("child", "reply", 700, "stop"))
+      await harness.flush()
+      await harness.waitFor(() => harness.contextReads === 1)
+      expect(harness.contextReads).toBe(1)
+    } finally {
+      await cleanup()
+    }
+  })
+
+  for (const [name, failure] of [
+    ["step.failed", stepFailed],
+    ["execution.failed", executionFailed],
+    ["execution.interrupted", executionInterrupted],
+  ] as const) {
+    test(`resets an armed response without verifying after ${name}`, async () => {
+      const harness = createPluginHarness()
+      const cleanup = await startHarness(harness)
+      try {
+        harness.emit(childCreated())
+        await harness.flush()
+        harness.emit(completedStep("child", "measure", 700))
+        await harness.flush()
+        await harness.runHook("context", { sessionID: "child", model: { providerID: "provider", id: "model" }, system: [] })
+        harness.emit(stepStarted())
+        harness.emit(textEnded("child", "reply", "partial"))
+        harness.emit(failure())
+        await harness.flush()
+        harness.emit(completedStep("child", "late-reply", 700))
+        await harness.flush()
+        expect(harness.contextReads).toBe(0)
+      } finally {
+        await cleanup()
+      }
+    })
+  }
+
+  test("retries visibility without counting unknown when history is late", async () => {
+    const harness = createPluginHarness()
+    const cleanup = await startHarness(harness)
+    const warning = spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      harness.emit(childCreated())
+      await harness.flush()
+      const model = { providerID: "provider", id: "model" }
+      const checkpoint = async (measurement: string) => {
+        harness.emit(completedStep("child", measurement, 700))
+        await harness.flush()
+        const request = { sessionID: "child", model, system: [] as unknown[] }
+        await harness.runHook("context", request)
+        return request.system.length
+      }
+      const reply = async (id: string, text: string) => {
+        harness.emit(stepStarted())
+        harness.emit(textEnded("child", id, text))
+        harness.appendMessage("child", { id, type: "assistant", content: [{ type: "text", text }] }, 3)
+        harness.emit(completedStep("child", id, 700))
+        await harness.flush()
+      }
+
+      expect(await checkpoint("measurement-1")).toBe(1)
+      await reply("late-plain", "No checkpoint")
+      await harness.waitFor(() => harness.contextReads === 3)
+      await harness.settle()
+      expect(harness.contextReads).toBe(3)
+      expect(warning.mock.calls.map(call => String(call[0])).filter(message => message.includes("consecutive-omissions"))).toEqual([])
+    } finally {
+      warning.mockRestore()
+      await cleanup()
+    }
+  })
+
+  test("discards a verification result after an epoch change", async () => {
+    const harness = createPluginHarness()
+    const cleanup = await startHarness(harness)
+    const warning = spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      harness.emit(childCreated())
+      await harness.flush()
+      harness.emit(completedStep("child", "measure", 700))
+      await harness.flush()
+      await harness.runHook("context", { sessionID: "child", model: { providerID: "provider", id: "model" }, system: [] })
+      const release = harness.blockNextContextRead()
+      harness.emit(stepStarted())
+      harness.emit(textEnded("child", "reply", "No checkpoint"))
+      harness.appendMessage("child", { id: "reply", type: "assistant", content: [{ type: "text", text: "No checkpoint" }] })
+      harness.emit(completedStep("child", "reply", 700))
+      await harness.waitFor(() => harness.contextReads === 1)
+      await harness.runHook("compaction", { sessionID: "child" })
+      release()
+      await harness.settle()
+      expect(warning.mock.calls.map(call => String(call[0])).filter(message => message.includes("consecutive-omissions") || message.includes("assistant-message-unavailable"))).toEqual([])
+    } finally {
+      warning.mockRestore()
+      await cleanup()
+    }
+  })
+
+  test("cancels a pending verification during plugin cleanup", async () => {
+    const harness = createPluginHarness()
+    const cleanup = await startHarness(harness)
+    const warning = spyOn(console, "warn").mockImplementation(() => {})
+    try {
+      harness.emit(childCreated())
+      await harness.flush()
+      harness.emit(completedStep("child", "measure", 700))
+      await harness.flush()
+      await harness.runHook("context", { sessionID: "child", model: { providerID: "provider", id: "model" }, system: [] })
+      const release = harness.blockNextContextRead()
+      harness.emit(stepStarted())
+      harness.emit(textEnded("child", "reply", "No checkpoint"))
+      harness.appendMessage("child", { id: "reply", type: "assistant", content: [{ type: "text", text: "No checkpoint" }] })
+      harness.emit(completedStep("child", "reply", 700))
+      await harness.waitFor(() => harness.contextReads === 1)
+      await cleanup()
+      release()
+      await harness.settle()
+      const cancellationWarnings = warning.mock.calls.map(call => String(call[0])).filter(message => message.includes("consecutive-omissions") || message.includes("assistant-message-unavailable"))
+      expect(cancellationWarnings.filter(message => message.includes("consecutive-omissions"))).toEqual([])
+      expect(cancellationWarnings.filter(message => message.includes("assistant-message-unavailable"))).toHaveLength(1)
+    } finally {
+      warning.mockRestore()
+    }
+  })
+
+  test("invalidates active windows on stream cuts and recovers after an event", async () => {
+    const delays: number[] = []
+    await withImmediateTimers(async () => {
+      const harness = createPluginHarness()
+      const cleanup = await startHarness(harness)
+      try {
+        harness.emit(childCreated())
+        await harness.flush()
+        harness.emit(completedStep("child", "measure", 700))
+        await harness.flush()
+        await harness.runHook("context", { sessionID: "child", model: { providerID: "provider", id: "model" }, system: [] })
+        harness.emit(stepStarted())
+        harness.emit(textEnded("child", "reply", "partial"))
+        await harness.flush()
+
+        harness.closeStream()
+        await harness.waitFor(() => harness.subscribeAttempts >= 2)
+        harness.emit(completedStep("child", "lost-reply", 700))
+        await harness.flush()
+        expect(harness.contextReads).toBe(0)
+
+        // A received event resets the consecutive stream-failure backoff.
+        harness.emit({ type: "session.created", data: { sessionID: "unrelated", location: { directory: "/project" } } })
+        await harness.flush()
+        harness.closeStream()
+        await harness.waitFor(() => harness.subscribeAttempts >= 3)
+        expect(harness.subscribeAttempts).toBe(3)
+        expect(delays.filter(delay => delay !== 10)).toEqual([250, 250])
+      } finally {
+        await cleanup()
+      }
+    }, delays)
+  })
+
+  test("stops after ten consecutive stream failures and logs once", async () => {
+    const delays: number[] = []
+    await withImmediateTimers(async () => {
+      const harness = createPluginHarness()
+      const cleanup = await startHarness(harness)
+      const warning = spyOn(console, "warn").mockImplementation(() => {})
+      try {
+        await harness.waitFor(() => harness.subscribeAttempts >= 1)
+        for (let failure = 0; failure < 10; failure++) {
+          harness.closeStream()
+          await harness.waitFor(() => harness.subscribeAttempts >= failure + 2 || warning.mock.calls.some(call => String(call[0]).includes("event-stream-failed")))
+        }
+        const streamWarnings = warning.mock.calls.map(call => String(call[0])).filter(message => message.includes("event-stream-failed"))
+        expect(streamWarnings).toHaveLength(1)
+        expect(harness.subscribeAttempts).toBe(10)
+        expect(delays.filter(delay => delay !== 10)).toEqual([250, 500, 1000, 2000, 4000, 5000, 5000, 5000, 5000])
+      } finally {
+        warning.mockRestore()
+        await cleanup()
+      }
+    }, delays)
   })
 })
